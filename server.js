@@ -43,12 +43,9 @@ async function fetchWsCredentials() {
     }
 
     wsToken = data.data.token;
-    wsSocketUrl = data.data.socket;
-    console.log('Socket URL recebida:', wsSocketUrl);
-
-    // Substitui tudo antes do path por wss://painel3...
-    wsSocketUrl = wsSocketUrl.replace(/^wss?:\/\/[^/]+/, 'wss://painel3.firegamesnetwork.com');
-    console.log('Socket URL corrigida para:', wsSocketUrl);
+    // Monta URL na mão com o path correto do Pterodactyl
+    wsSocketUrl = `wss://painel3.firegamesnetwork.com/api/client/servers/${SERVER_ID}/websocket`;
+    console.log('Socket URL usada:', wsSocketUrl);
     return true;
   } catch (e) {
     console.error('Failed to fetch WS credentials:', e.message);
