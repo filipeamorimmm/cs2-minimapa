@@ -1,5 +1,4 @@
 const express = require('express');
-const net = require('net');
 const app = express();
 app.use(express.json());
 
@@ -12,94 +11,76 @@ let matchState = {
   phase: 'aguardando',
   players: {},
 };
-let rconData = {};
+let pterodactylData = { players: [], map: null, updated: null, raw: '' };
 
-// RCON config
-const RCON_HOST = '103.14.27.41';
-const RCON_PORT = 27288;
-const RCON_PASSWORD = 'minimapa123';
+// ─── PTERODACTYL CONFIG ───────────────────────────────────────────────────────
+const PTERO_URL = 'https://painel3.firegamesnetwork.com';
+const PTERO_KEY = 'ptlc_xWQ2v95dY1ds00JAX39dQPVuwivxCe0aBLNF1QZhzYt';
+const SERVER_ID = 'a93a9b62';
 
-// ─── RCON ────────────────────────────────────────────────────────────────────
-class RCON {
-  constructor(host, port, password) {
-    this.host = host;
-    this.port = port;
-    this.password = password;
-  }
-
-  createPacket(id, type, body) {
-    const bodyBuffer = Buffer.from(body + '\0', 'utf8');
-    const buf = Buffer.alloc(4 + 4 + 4 + bodyBuffer.length + 1);
-    buf.writeInt32LE(buf.length - 4, 0);
-    buf.writeInt32LE(id, 4);
-    buf.writeInt32LE(type, 8);
-    bodyBuffer.copy(buf, 12);
-    buf.writeUInt8(0, buf.length - 1);
-    return buf;
-  }
-
-  send(command) {
-    return new Promise((resolve, reject) => {
-      const socket = new net.Socket();
-      let buffer = Buffer.alloc(0);
-      let authenticated = false;
-      const timeout = setTimeout(() => { socket.destroy(); reject(new Error('timeout')); }, 5000);
-
-      socket.connect(this.port, this.host, () => {
-        socket.write(this.createPacket(1, 3, this.password));
-      });
-
-      socket.on('data', (data) => {
-        buffer = Buffer.concat([buffer, data]);
-        while (buffer.length >= 4) {
-          const len = buffer.readInt32LE(0) + 4;
-          if (buffer.length < len) break;
-          const packet = buffer.slice(0, len);
-          buffer = buffer.slice(len);
-          const body = packet.slice(12, packet.length - 2).toString('utf8');
-          if (!authenticated) {
-            authenticated = true;
-            socket.write(this.createPacket(2, 2, command));
-          } else {
-            clearTimeout(timeout);
-            socket.destroy();
-            resolve(body);
-          }
-        }
-      });
-
-      socket.on('error', (err) => { clearTimeout(timeout); reject(err); });
+async function pterodactylCommand(command) {
+  try {
+    const res = await fetch(`${PTERO_URL}/api/client/servers/${SERVER_ID}/command`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${PTERO_KEY}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify({ command })
     });
+    return res.status === 204;
+  } catch (e) {
+    console.error('Pterodactyl command error:', e.message);
+    return false;
   }
 }
 
-const rcon = new RCON(RCON_HOST, RCON_PORT, RCON_PASSWORD);
+async function pterodactylLogs() {
+  try {
+    const res = await fetch(`${PTERO_URL}/api/client/servers/${SERVER_ID}/websocket`, {
+      headers: {
+        'Authorization': `Bearer ${PTERO_KEY}`,
+        'Accept': 'application/json'
+      }
+    });
+    const data = await res.json();
+    return data;
+  } catch (e) {
+    return null;
+  }
+}
 
-async function parseStatus(raw) {
+function parseStatus(raw) {
   const lines = raw.split('\n');
   const players = [];
   for (const line of lines) {
-    const m = line.match(/^\s*#\s*(\d+)\s+"(.+?)"\s+(\S+)\s+(\d+)\s+(\d+:\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\S+)/);
-    if (m) players.push({ userid: m[1], name: m[2], steamid: m[3], ping: m[4] });
+    const m = line.match(/^\s*#\s*(\d+)\s+"(.+?)"\s+(\S+)\s+(\d+)\s+(\d+:\d+)/);
+    if (m && m[2] !== 'SourceTV') {
+      players.push({ userid: m[1], name: m[2], steamid: m[3], ping: m[4] });
+    }
   }
   const mapM = raw.match(/map\s*:\s*(\S+)/);
   return { players, map: mapM ? mapM[1] : null };
 }
 
-async function pollRcon() {
+// Buffer para capturar output do console via POST /console
+let consoleBuffer = '';
+
+async function pollPterodactyl() {
   try {
-    const statusRaw = await rcon.send('status');
-    const status = await parseStatus(statusRaw);
-    rconData = { ...status, updated: Date.now() };
-    if (status.map) matchState.map = status.map;
-  } catch (e) { /* silently fail */ }
+    // Envia status para o console — o output chega via /console endpoint
+    await pterodactylCommand('status');
+  } catch (e) {}
 }
 
-setInterval(pollRcon, 5000);
-pollRcon();
+// Inicia polling a cada 5 segundos
+setInterval(pollPterodactyl, 5000);
+setTimeout(pollPterodactyl, 2000);
 
-// ─── GET5 WEBHOOK ─────────────────────────────────────────────────────────────
-// O Get5 manda POST para /get5 com { event: "...", params: {...} }
+// ─── ENDPOINTS ────────────────────────────────────────────────────────────────
+
+// Recebe eventos do MatchZy (quando funcionar)
 app.post('/get5', (req, res) => {
   const body = req.body;
   if (!body || !body.event) return res.sendStatus(400);
@@ -107,21 +88,17 @@ app.post('/get5', (req, res) => {
   const ev = body.event;
   const p = body.params || {};
 
-  // Guarda histórico
   get5Events.unshift({ event: ev, params: p, ts: Date.now() });
   if (get5Events.length > 100) get5Events.pop();
 
-  // Atualiza matchState conforme o evento
   switch (ev) {
     case 'game_state_changed':
       matchState.phase = p.new_state || matchState.phase;
       break;
-
     case 'map_picked':
     case 'map_result':
       if (p.map_name) matchState.map = p.map_name;
       break;
-
     case 'series_start':
       matchState.team1.name = p.team1_name || 'CT';
       matchState.team2.name = p.team2_name || 'TR';
@@ -130,57 +107,65 @@ app.post('/get5', (req, res) => {
       matchState.round = 0;
       matchState.players = {};
       break;
-
     case 'round_start':
       matchState.round = p.round_number ?? matchState.round;
       break;
-
     case 'round_end':
       matchState.round = p.round_number ?? matchState.round;
       matchState.team1.score = p.team1_score ?? matchState.team1.score;
       matchState.team2.score = p.team2_score ?? matchState.team2.score;
       break;
-
     case 'player_death': {
-      // Conta kills por jogador
       const killer = p.attacker_steamid;
       if (killer && killer !== p.victim_steamid) {
-        if (!matchState.players[killer]) {
-          matchState.players[killer] = { name: p.attacker_name || killer, kills: 0, deaths: 0, assists: 0 };
-        }
+        if (!matchState.players[killer]) matchState.players[killer] = { name: p.attacker_name || killer, kills: 0, deaths: 0, assists: 0 };
         matchState.players[killer].kills++;
         matchState.players[killer].name = p.attacker_name || killer;
       }
       const victim = p.victim_steamid;
       if (victim) {
-        if (!matchState.players[victim]) {
-          matchState.players[victim] = { name: p.victim_name || victim, kills: 0, deaths: 0, assists: 0 };
-        }
+        if (!matchState.players[victim]) matchState.players[victim] = { name: p.victim_name || victim, kills: 0, deaths: 0, assists: 0 };
         matchState.players[victim].deaths++;
         matchState.players[victim].name = p.victim_name || victim;
       }
       if (p.assister_steamid) {
         const a = p.assister_steamid;
-        if (!matchState.players[a]) {
-          matchState.players[a] = { name: p.assister_name || a, kills: 0, deaths: 0, assists: 0 };
-        }
+        if (!matchState.players[a]) matchState.players[a] = { name: p.assister_name || a, kills: 0, deaths: 0, assists: 0 };
         matchState.players[a].assists++;
-        matchState.players[a].name = p.assister_name || a;
       }
       break;
     }
-
     case 'series_end':
       matchState.phase = 'encerrado';
-      matchState.team1.score = p.team1_series_score ?? matchState.team1.score;
-      matchState.team2.score = p.team2_series_score ?? matchState.team2.score;
       break;
   }
 
   res.sendStatus(200);
 });
 
-// Endpoint legado — mantido caso algo ainda mande pro /
+// Recebe output do console do servidor via webhook do Pterodactyl
+app.post('/console', (req, res) => {
+  const body = req.body;
+  const line = body.line || body.output || body.data || '';
+  if (line) {
+    consoleBuffer += line + '\n';
+    // Mantém só as últimas 200 linhas
+    const lines = consoleBuffer.split('\n');
+    if (lines.length > 200) consoleBuffer = lines.slice(-200).join('\n');
+
+    // Tenta parsear status
+    if (line.includes('map     :') || line.includes('players :')) {
+      const parsed = parseStatus(consoleBuffer);
+      if (parsed.players.length > 0 || parsed.map) {
+        pterodactylData = { ...parsed, updated: Date.now(), raw: consoleBuffer.slice(-2000) };
+        if (parsed.map) matchState.map = parsed.map;
+      }
+    }
+  }
+  res.sendStatus(200);
+});
+
+// Endpoint legado
 app.post('/', (req, res) => {
   const body = req.body;
   if (body && body.event) {
@@ -191,7 +176,7 @@ app.post('/', (req, res) => {
 });
 
 app.get('/state', (req, res) => {
-  res.json({ matchState, get5Events: get5Events.slice(0, 50), rconData });
+  res.json({ matchState, get5Events: get5Events.slice(0, 50), pterodactylData });
 });
 
 // ─── FRONTEND ─────────────────────────────────────────────────────────────────
@@ -218,9 +203,6 @@ header h1 { font-size:14px; font-weight:600; letter-spacing:2px; text-transform:
 .team-score { font-size:40px; font-weight:800; color:#f0a500; line-height:1; }
 .score-divider { font-size:20px; color:#333; padding:0 8px; }
 .round-info { text-align:center; font-size:11px; color:#666; margin-top:6px; }
-.phase-badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:10px;
-  background:#1a2a1a; color:#4caf50; text-transform:uppercase; letter-spacing:1px; margin-top:4px; }
-.phase-badge.waiting { background:#1a1a1a; color:#666; }
 .player-row { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid #1a1a22; font-size:12px; }
 .player-row:last-child { border-bottom:none; }
 .player-name { flex:1; }
@@ -236,8 +218,7 @@ header h1 { font-size:14px; font-weight:600; letter-spacing:2px; text-transform:
 <body>
 <header><h1>⚡ CS2 Live</h1><span id="status">aguardando...</span></header>
 <div class="container">
-  <div id="nodata" class="no-data">Aguardando partida...<br><small>Conectando via Get5 + RCON</small></div>
-
+  <div id="nodata" class="no-data">Aguardando partida...<br><small>Conectando via Pterodactyl API</small></div>
   <div id="score-card" class="card" style="display:none">
     <div class="card-title">Placar</div>
     <div class="scoreboard">
@@ -247,17 +228,14 @@ header h1 { font-size:14px; font-weight:600; letter-spacing:2px; text-transform:
     </div>
     <div class="round-info">Round <span id="round-num">—</span> · <span id="phase-text">—</span></div>
   </div>
-
   <div id="map-card" class="card" style="display:none">
     <div class="card-title">Mapa</div>
     <div class="map-name" id="map-name">—</div>
   </div>
-
   <div id="players-card" class="card" style="display:none">
-    <div class="card-title">Jogadores (K / D / A)</div>
+    <div class="card-title">Jogadores</div>
     <div id="players-list"></div>
   </div>
-
   <div id="events-card" class="card" style="display:none">
     <div class="card-title">Eventos recentes</div>
     <div id="events-list"></div>
@@ -269,44 +247,37 @@ function timeSince(ts) {
   if (s < 60) return s + 's atrás';
   return Math.floor(s/60) + 'min atrás';
 }
-
 function eventDesc(ev, p) {
   switch(ev) {
-    case 'player_death':
-      return (p.attacker_name||'?') + ' ➜ ' + (p.victim_name||'?') + (p.weapon ? ' ['+p.weapon+']' : '');
-    case 'round_end':
-      return 'Round ' + (p.round_number||'?') + ' encerrado · ' + (p.winner||'');
-    case 'bomb_planted':   return '💣 Bomba plantada por ' + (p.player_name||'?');
-    case 'bomb_defused':   return '✅ Bomba defusada por ' + (p.player_name||'?');
-    case 'bomb_exploded':  return '💥 Bomba explodiu!';
-    case 'series_start':   return '🟢 Série iniciada';
-    case 'series_end':     return '🏁 Série encerrada';
-    case 'map_picked':     return '🗺️ Mapa escolhido: ' + (p.map_name||'?');
-    case 'game_state_changed': return '⚙️ Estado: ' + (p.new_state||'?');
+    case 'player_death': return (p.attacker_name||'?') + ' ➜ ' + (p.victim_name||'?') + (p.weapon ? ' ['+p.weapon+']' : '');
+    case 'round_end': return 'Round ' + (p.round_number||'?') + ' encerrado';
+    case 'bomb_planted': return '💣 Bomba plantada por ' + (p.player_name||'?');
+    case 'bomb_defused': return '✅ Bomba defusada por ' + (p.player_name||'?');
+    case 'bomb_exploded': return '💥 Bomba explodiu!';
+    case 'series_start': return '🟢 Série iniciada';
+    case 'series_end': return '🏁 Série encerrada';
     default: return ev;
   }
 }
-
 async function fetchState() {
   try {
     const res = await fetch('/state');
     const data = await res.json();
     const ms = data.matchState || {};
     const events = data.get5Events || [];
-    const rcon = data.rconData || {};
+    const ptero = data.pterodactylData || {};
 
     const hasMatch = ms.phase && ms.phase !== 'aguardando';
     const hasPlayers = Object.keys(ms.players || {}).length > 0;
-    const hasRconPlayers = rcon.players && rcon.players.length > 0;
-    const hasData = hasMatch || hasPlayers || hasRconPlayers || rcon.map;
+    const hasPteroPlayers = ptero.players && ptero.players.length > 0;
+    const map = ms.map || ptero.map;
+    const hasData = hasMatch || hasPlayers || hasPteroPlayers || map;
 
     document.getElementById('nodata').style.display = hasData ? 'none' : 'block';
-
     const statusEl = document.getElementById('status');
     statusEl.textContent = hasData ? '● AO VIVO' : 'aguardando...';
     statusEl.className = hasData ? 'live' : '';
 
-    // Placar
     const showScore = hasMatch || (ms.team1 && (ms.team1.score > 0 || ms.team2.score > 0));
     document.getElementById('score-card').style.display = showScore ? 'block' : 'none';
     if (showScore) {
@@ -318,40 +289,26 @@ async function fetchState() {
       document.getElementById('phase-text').textContent = ms.phase || '—';
     }
 
-    // Mapa
-    const map = ms.map || rcon.map;
     document.getElementById('map-card').style.display = map ? 'block' : 'none';
     if (map) document.getElementById('map-name').textContent = map;
 
-    // Jogadores KDA (do Get5)
-    document.getElementById('players-card').style.display = hasPlayers ? 'block' : 'none';
+    document.getElementById('players-card').style.display = (hasPlayers || hasPteroPlayers) ? 'block' : 'none';
     if (hasPlayers) {
       const list = document.getElementById('players-list');
       const sorted = Object.values(ms.players).sort((a,b) => b.kills - a.kills);
-      list.innerHTML = sorted.map(p =>
-        '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.kills+'/'+p.deaths+'/'+p.assists+'</span></div>'
-      ).join('');
-    } else if (hasRconPlayers) {
-      // Fallback: lista do RCON se Get5 ainda não mandou dados
-      document.getElementById('players-card').style.display = 'block';
+      list.innerHTML = sorted.map(p => '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.kills+'/'+p.deaths+'/'+p.assists+'</span></div>').join('');
+    } else if (hasPteroPlayers) {
       const list = document.getElementById('players-list');
-      list.innerHTML = rcon.players.map(p =>
-        '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.ping+'ms</span></div>'
-      ).join('');
+      list.innerHTML = ptero.players.map(p => '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.ping+'ms</span></div>').join('');
     }
 
-    // Eventos
     document.getElementById('events-card').style.display = events.length > 0 ? 'block' : 'none';
     if (events.length > 0) {
       const evEl = document.getElementById('events-list');
-      evEl.innerHTML = events.slice(0, 15).map(ev =>
-        '<div class="event-row"><span class="event-type">'+ev.event+'</span><span style="flex:1">'+eventDesc(ev.event, ev.params||{})+'</span><span class="event-time">'+timeSince(ev.ts)+'</span></div>'
-      ).join('');
+      evEl.innerHTML = events.slice(0, 15).map(ev => '<div class="event-row"><span class="event-type">'+ev.event+'</span><span style="flex:1">'+eventDesc(ev.event, ev.params||{})+'</span><span class="event-time">'+timeSince(ev.ts)+'</span></div>').join('');
     }
-
   } catch(e) {}
 }
-
 setInterval(fetchState, 2000);
 fetchState();
 </script>
