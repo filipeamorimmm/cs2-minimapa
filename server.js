@@ -97,6 +97,7 @@ const MAP_DATA = {
   de_ancient:{x:-2953,y:2164,scale:5.0},
   de_anubis:{x:-2796,y:3328,scale:5.22},
   de_vertigo:{x:-3168,y:1762,scale:4.0},
+  de_cache:{x:-2000,y:3250,scale:5.5},
 };
 let lastMap=null,mapImg=null;
 function worldToCanvas(x,y,mapName,size){
