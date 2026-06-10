@@ -1,4 +1,6 @@
+cat > /mnt/user-data/outputs/server.js << 'ENDOFFILE'
 const express = require('express');
+const WebSocket = require('ws');
 const app = express();
 app.use(express.json());
 
@@ -11,32 +13,20 @@ let matchState = {
   phase: 'aguardando',
   players: {},
 };
-let pterodactylData = { players: [], map: null, updated: null, raw: '' };
+let consoleData = { players: [], map: null, updated: null };
+let consoleLines = [];
 
 // ─── PTERODACTYL CONFIG ───────────────────────────────────────────────────────
 const PTERO_URL = 'https://painel3.firegamesnetwork.com';
 const PTERO_KEY = 'ptlc_xWQ2v95dY1ds00JAX39dQPVuwivxCe0aBLNF1QZhzYt';
 const SERVER_ID = 'a93a9b62';
 
-async function pterodactylCommand(command) {
-  try {
-    const res = await fetch(`${PTERO_URL}/api/client/servers/${SERVER_ID}/command`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${PTERO_KEY}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
-      body: JSON.stringify({ command })
-    });
-    return res.status === 204;
-  } catch (e) {
-    console.error('Pterodactyl command error:', e.message);
-    return false;
-  }
-}
+let wsClient = null;
+let wsToken = null;
+let wsSocketUrl = null;
+let reconnectTimer = null;
 
-async function pterodactylLogs() {
+async function fetchWsCredentials() {
   try {
     const res = await fetch(`${PTERO_URL}/api/client/servers/${SERVER_ID}/websocket`, {
       headers: {
@@ -45,14 +35,16 @@ async function pterodactylLogs() {
       }
     });
     const data = await res.json();
-    return data;
+    wsToken = data.data.token;
+    wsSocketUrl = data.data.socket;
+    return true;
   } catch (e) {
-    return null;
+    console.error('Failed to fetch WS credentials:', e.message);
+    return false;
   }
 }
 
-function parseStatus(raw) {
-  const lines = raw.split('\n');
+function parseStatusBlock(lines) {
   const players = [];
   for (const line of lines) {
     const m = line.match(/^\s*#\s*(\d+)\s+"(.+?)"\s+(\S+)\s+(\d+)\s+(\d+:\d+)/);
@@ -60,27 +52,88 @@ function parseStatus(raw) {
       players.push({ userid: m[1], name: m[2], steamid: m[3], ping: m[4] });
     }
   }
-  const mapM = raw.match(/map\s*:\s*(\S+)/);
-  return { players, map: mapM ? mapM[1] : null };
+  const mapLine = lines.find(l => l.includes('map     :') || l.match(/map\s*:\s*\S+/));
+  let map = null;
+  if (mapLine) {
+    const mm = mapLine.match(/map\s*:\s*(\S+)/);
+    if (mm) map = mm[1];
+  }
+  return { players, map };
 }
 
-// Buffer para capturar output do console via POST /console
-let consoleBuffer = '';
+function processConsoleLine(line) {
+  consoleLines.push(line);
+  if (consoleLines.length > 300) consoleLines = consoleLines.slice(-300);
 
-async function pollPterodactyl() {
-  try {
-    // Envia status para o console — o output chega via /console endpoint
-    await pterodactylCommand('status');
-  } catch (e) {}
+  // Detecta bloco de status
+  if (line.includes('#end') && consoleLines.some(l => l.includes('map     :'))) {
+    const parsed = parseStatusBlock(consoleLines);
+    if (parsed.map) {
+      consoleData = { ...parsed, updated: Date.now() };
+      if (parsed.map) matchState.map = parsed.map;
+    }
+  }
+
+  // Detecta eventos do MatchZy no console
+  if (line.includes('[MatchZy]') && line.includes('round_end')) {
+    // extrai placar se possível
+  }
 }
 
-// Inicia polling a cada 5 segundos
-setInterval(pollPterodactyl, 5000);
-setTimeout(pollPterodactyl, 2000);
+async function sendWsCommand(command) {
+  if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+    wsClient.send(JSON.stringify({ event: 'send command', args: [command] }));
+  }
+}
 
-// ─── ENDPOINTS ────────────────────────────────────────────────────────────────
+async function connectWebSocket() {
+  const ok = await fetchWsCredentials();
+  if (!ok) {
+    reconnectTimer = setTimeout(connectWebSocket, 10000);
+    return;
+  }
 
-// Recebe eventos do MatchZy (quando funcionar)
+  console.log('Connecting to Pterodactyl WebSocket...');
+  wsClient = new WebSocket(wsSocketUrl, {
+    headers: { 'Origin': PTERO_URL }
+  });
+
+  wsClient.on('open', () => {
+    console.log('WebSocket connected!');
+    wsClient.send(JSON.stringify({ event: 'auth', args: [wsToken] }));
+  });
+
+  wsClient.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.event === 'console output' && msg.args) {
+        msg.args.forEach(line => processConsoleLine(line));
+      }
+      if (msg.event === 'token expiring' || msg.event === 'token expired') {
+        fetchWsCredentials().then(() => {
+          if (wsToken) wsClient.send(JSON.stringify({ event: 'auth', args: [wsToken] }));
+        });
+      }
+    } catch (e) {}
+  });
+
+  wsClient.on('close', () => {
+    console.log('WebSocket closed, reconnecting in 5s...');
+    reconnectTimer = setTimeout(connectWebSocket, 5000);
+  });
+
+  wsClient.on('error', (err) => {
+    console.error('WebSocket error:', err.message);
+  });
+}
+
+// Envia status a cada 5 segundos
+setInterval(() => sendWsCommand('status'), 5000);
+
+// Inicia conexão WebSocket
+connectWebSocket();
+
+// ─── GET5 / MATCHZY WEBHOOK ───────────────────────────────────────────────────
 app.post('/get5', (req, res) => {
   const body = req.body;
   if (!body || !body.event) return res.sendStatus(400);
@@ -94,10 +147,6 @@ app.post('/get5', (req, res) => {
   switch (ev) {
     case 'game_state_changed':
       matchState.phase = p.new_state || matchState.phase;
-      break;
-    case 'map_picked':
-    case 'map_result':
-      if (p.map_name) matchState.map = p.map_name;
       break;
     case 'series_start':
       matchState.team1.name = p.team1_name || 'CT';
@@ -135,6 +184,9 @@ app.post('/get5', (req, res) => {
       }
       break;
     }
+    case 'map_picked':
+      if (p.map_name) matchState.map = p.map_name;
+      break;
     case 'series_end':
       matchState.phase = 'encerrado';
       break;
@@ -143,29 +195,6 @@ app.post('/get5', (req, res) => {
   res.sendStatus(200);
 });
 
-// Recebe output do console do servidor via webhook do Pterodactyl
-app.post('/console', (req, res) => {
-  const body = req.body;
-  const line = body.line || body.output || body.data || '';
-  if (line) {
-    consoleBuffer += line + '\n';
-    // Mantém só as últimas 200 linhas
-    const lines = consoleBuffer.split('\n');
-    if (lines.length > 200) consoleBuffer = lines.slice(-200).join('\n');
-
-    // Tenta parsear status
-    if (line.includes('map     :') || line.includes('players :')) {
-      const parsed = parseStatus(consoleBuffer);
-      if (parsed.players.length > 0 || parsed.map) {
-        pterodactylData = { ...parsed, updated: Date.now(), raw: consoleBuffer.slice(-2000) };
-        if (parsed.map) matchState.map = parsed.map;
-      }
-    }
-  }
-  res.sendStatus(200);
-});
-
-// Endpoint legado
 app.post('/', (req, res) => {
   const body = req.body;
   if (body && body.event) {
@@ -176,7 +205,7 @@ app.post('/', (req, res) => {
 });
 
 app.get('/state', (req, res) => {
-  res.json({ matchState, get5Events: get5Events.slice(0, 50), pterodactylData });
+  res.json({ matchState, get5Events: get5Events.slice(0, 50), consoleData });
 });
 
 // ─── FRONTEND ─────────────────────────────────────────────────────────────────
@@ -208,17 +237,17 @@ header h1 { font-size:14px; font-weight:600; letter-spacing:2px; text-transform:
 .player-name { flex:1; }
 .kda { color:#888; font-size:11px; font-family:monospace; }
 .map-name { font-size:18px; font-weight:700; color:#f0a500; }
-.event-row { font-size:11px; color:#888; padding:4px 0; border-bottom:1px solid #1a1a22; display:flex; gap:6px; align-items:baseline; }
+.event-row { font-size:11px; color:#888; padding:4px 0; border-bottom:1px solid #1a1a22; display:flex; gap:6px; }
 .event-row:last-child { border-bottom:none; }
 .event-type { color:#f0a500; white-space:nowrap; }
-.event-time { color:#444; font-size:10px; white-space:nowrap; }
+.event-time { color:#444; font-size:10px; white-space:nowrap; margin-left:auto; }
 .no-data { text-align:center; padding:40px 20px; color:#444; font-size:13px; }
 </style>
 </head>
 <body>
 <header><h1>⚡ CS2 Live</h1><span id="status">aguardando...</span></header>
 <div class="container">
-  <div id="nodata" class="no-data">Aguardando partida...<br><small>Conectando via Pterodactyl API</small></div>
+  <div id="nodata" class="no-data">Aguardando partida...<br><small>Conectando via WebSocket</small></div>
   <div id="score-card" class="card" style="display:none">
     <div class="card-title">Placar</div>
     <div class="scoreboard">
@@ -251,8 +280,8 @@ function eventDesc(ev, p) {
   switch(ev) {
     case 'player_death': return (p.attacker_name||'?') + ' ➜ ' + (p.victim_name||'?') + (p.weapon ? ' ['+p.weapon+']' : '');
     case 'round_end': return 'Round ' + (p.round_number||'?') + ' encerrado';
-    case 'bomb_planted': return '💣 Bomba plantada por ' + (p.player_name||'?');
-    case 'bomb_defused': return '✅ Bomba defusada por ' + (p.player_name||'?');
+    case 'bomb_planted': return '💣 Plantada por ' + (p.player_name||'?');
+    case 'bomb_defused': return '✅ Defusada por ' + (p.player_name||'?');
     case 'bomb_exploded': return '💥 Bomba explodiu!';
     case 'series_start': return '🟢 Série iniciada';
     case 'series_end': return '🏁 Série encerrada';
@@ -265,13 +294,13 @@ async function fetchState() {
     const data = await res.json();
     const ms = data.matchState || {};
     const events = data.get5Events || [];
-    const ptero = data.pterodactylData || {};
+    const cd = data.consoleData || {};
 
     const hasMatch = ms.phase && ms.phase !== 'aguardando';
     const hasPlayers = Object.keys(ms.players || {}).length > 0;
-    const hasPteroPlayers = ptero.players && ptero.players.length > 0;
-    const map = ms.map || ptero.map;
-    const hasData = hasMatch || hasPlayers || hasPteroPlayers || map;
+    const hasConsole = cd.players && cd.players.length > 0;
+    const map = ms.map || cd.map;
+    const hasData = hasMatch || hasPlayers || hasConsole || map;
 
     document.getElementById('nodata').style.display = hasData ? 'none' : 'block';
     const statusEl = document.getElementById('status');
@@ -292,20 +321,24 @@ async function fetchState() {
     document.getElementById('map-card').style.display = map ? 'block' : 'none';
     if (map) document.getElementById('map-name').textContent = map;
 
-    document.getElementById('players-card').style.display = (hasPlayers || hasPteroPlayers) ? 'block' : 'none';
+    document.getElementById('players-card').style.display = (hasPlayers || hasConsole) ? 'block' : 'none';
     if (hasPlayers) {
       const list = document.getElementById('players-list');
-      const sorted = Object.values(ms.players).sort((a,b) => b.kills - a.kills);
-      list.innerHTML = sorted.map(p => '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.kills+'/'+p.deaths+'/'+p.assists+'</span></div>').join('');
-    } else if (hasPteroPlayers) {
+      list.innerHTML = Object.values(ms.players).sort((a,b)=>b.kills-a.kills).map(p =>
+        '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.kills+'/'+p.deaths+'/'+p.assists+'</span></div>'
+      ).join('');
+    } else if (hasConsole) {
       const list = document.getElementById('players-list');
-      list.innerHTML = ptero.players.map(p => '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.ping+'ms</span></div>').join('');
+      list.innerHTML = cd.players.map(p =>
+        '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.ping+'ms</span></div>'
+      ).join('');
     }
 
     document.getElementById('events-card').style.display = events.length > 0 ? 'block' : 'none';
     if (events.length > 0) {
-      const evEl = document.getElementById('events-list');
-      evEl.innerHTML = events.slice(0, 15).map(ev => '<div class="event-row"><span class="event-type">'+ev.event+'</span><span style="flex:1">'+eventDesc(ev.event, ev.params||{})+'</span><span class="event-time">'+timeSince(ev.ts)+'</span></div>').join('');
+      document.getElementById('events-list').innerHTML = events.slice(0,15).map(ev =>
+        '<div class="event-row"><span class="event-type">'+ev.event+'</span><span style="flex:1">'+eventDesc(ev.event,ev.params||{})+'</span><span class="event-time">'+timeSince(ev.ts)+'</span></div>'
+      ).join('');
     }
   } catch(e) {}
 }
@@ -318,3 +351,5 @@ fetchState();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('CS2 Live rodando na porta ' + PORT));
+ENDOFFILE
+echo "Done"
