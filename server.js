@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/server.js << 'ENDOFFILE'
 const express = require('express');
 const WebSocket = require('ws');
 const app = express();
@@ -351,5 +350,3 @@ fetchState();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('CS2 Live rodando na porta ' + PORT));
-ENDOFFILE
-echo "Done"
