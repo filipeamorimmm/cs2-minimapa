@@ -34,8 +34,10 @@ async function fetchWsCredentials() {
       }
     });
     const data = await res.json();
+    console.log('WS credentials response:', JSON.stringify(data));  // DEBUG
     wsToken = data.data.token;
     wsSocketUrl = data.data.socket;
+    console.log('Socket URL recebida:', wsSocketUrl);  // DEBUG
     return true;
   } catch (e) {
     console.error('Failed to fetch WS credentials:', e.message);
@@ -64,18 +66,12 @@ function processConsoleLine(line) {
   consoleLines.push(line);
   if (consoleLines.length > 300) consoleLines = consoleLines.slice(-300);
 
-  // Detecta bloco de status
   if (line.includes('#end') && consoleLines.some(l => l.includes('map     :'))) {
     const parsed = parseStatusBlock(consoleLines);
     if (parsed.map) {
       consoleData = { ...parsed, updated: Date.now() };
-      if (parsed.map) matchState.map = parsed.map;
+      matchState.map = parsed.map;
     }
-  }
-
-  // Detecta eventos do MatchZy no console
-  if (line.includes('[MatchZy]') && line.includes('round_end')) {
-    // extrai placar se possível
   }
 }
 
@@ -92,6 +88,12 @@ async function connectWebSocket() {
     return;
   }
 
+  // Se a URL vier com IP:8080, troca pelo domínio
+  if (wsSocketUrl && wsSocketUrl.includes('103.14.27.41:8080')) {
+    wsSocketUrl = wsSocketUrl.replace('ws://103.14.27.41:8080', 'wss://painel3.firegamesnetwork.com');
+    console.log('Socket URL corrigida para:', wsSocketUrl);
+  }
+
   console.log('Connecting to Pterodactyl WebSocket...');
   wsClient = new WebSocket(wsSocketUrl, {
     headers: { 'Origin': PTERO_URL }
@@ -105,6 +107,7 @@ async function connectWebSocket() {
   wsClient.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
+      console.log('WS event:', msg.event);  // DEBUG
       if (msg.event === 'console output' && msg.args) {
         msg.args.forEach(line => processConsoleLine(line));
       }
@@ -126,17 +129,13 @@ async function connectWebSocket() {
   });
 }
 
-// Envia status a cada 5 segundos
 setInterval(() => sendWsCommand('status'), 5000);
-
-// Inicia conexão WebSocket
 connectWebSocket();
 
 // ─── GET5 / MATCHZY WEBHOOK ───────────────────────────────────────────────────
 app.post('/get5', (req, res) => {
   const body = req.body;
   if (!body || !body.event) return res.sendStatus(400);
-
   const ev = body.event;
   const p = body.params || {};
 
@@ -190,7 +189,6 @@ app.post('/get5', (req, res) => {
       matchState.phase = 'encerrado';
       break;
   }
-
   res.sendStatus(200);
 });
 
@@ -294,18 +292,15 @@ async function fetchState() {
     const ms = data.matchState || {};
     const events = data.get5Events || [];
     const cd = data.consoleData || {};
-
     const hasMatch = ms.phase && ms.phase !== 'aguardando';
     const hasPlayers = Object.keys(ms.players || {}).length > 0;
     const hasConsole = cd.players && cd.players.length > 0;
     const map = ms.map || cd.map;
     const hasData = hasMatch || hasPlayers || hasConsole || map;
-
     document.getElementById('nodata').style.display = hasData ? 'none' : 'block';
     const statusEl = document.getElementById('status');
     statusEl.textContent = hasData ? '● AO VIVO' : 'aguardando...';
     statusEl.className = hasData ? 'live' : '';
-
     const showScore = hasMatch || (ms.team1 && (ms.team1.score > 0 || ms.team2.score > 0));
     document.getElementById('score-card').style.display = showScore ? 'block' : 'none';
     if (showScore) {
@@ -316,10 +311,8 @@ async function fetchState() {
       document.getElementById('round-num').textContent = ms.round || '—';
       document.getElementById('phase-text').textContent = ms.phase || '—';
     }
-
     document.getElementById('map-card').style.display = map ? 'block' : 'none';
     if (map) document.getElementById('map-name').textContent = map;
-
     document.getElementById('players-card').style.display = (hasPlayers || hasConsole) ? 'block' : 'none';
     if (hasPlayers) {
       const list = document.getElementById('players-list');
@@ -332,7 +325,6 @@ async function fetchState() {
         '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.ping+'ms</span></div>'
       ).join('');
     }
-
     document.getElementById('events-card').style.display = events.length > 0 ? 'block' : 'none';
     if (events.length > 0) {
       document.getElementById('events-list').innerHTML = events.slice(0,15).map(ev =>
