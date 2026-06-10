@@ -34,9 +34,23 @@ async function fetchWsCredentials() {
     });
     const data = await res.json();
     console.log('WS credentials response:', JSON.stringify(data));
+
+    if (!data.data || !data.data.token) {
+      console.error('Sem token na resposta:', JSON.stringify(data));
+      return false;
+    }
+
     wsToken = data.data.token;
     wsSocketUrl = data.data.socket;
     console.log('Socket URL recebida:', wsSocketUrl);
+
+    // Corrige: ws:// → wss:// e remove :8080 mantendo o path completo
+    wsSocketUrl = wsSocketUrl
+      .replace(/^ws:\/\/[^/]+/, (match) => {
+        return 'wss://painel3.firegamesnetwork.com';
+      });
+
+    console.log('Socket URL corrigida para:', wsSocketUrl);
     return true;
   } catch (e) {
     console.error('Failed to fetch WS credentials:', e.message);
@@ -83,15 +97,9 @@ async function sendWsCommand(command) {
 async function connectWebSocket() {
   const ok = await fetchWsCredentials();
   if (!ok) {
-    reconnectTimer = setTimeout(connectWebSocket, 10000);
+    console.log('Aguardando 30s antes de tentar novamente...');
+    reconnectTimer = setTimeout(connectWebSocket, 30000);
     return;
-  }
-
-  if (wsSocketUrl) {
-    wsSocketUrl = wsSocketUrl
-      .replace('ws://', 'wss://')
-      .replace(':8080', '');
-    console.log('Socket URL corrigida para:', wsSocketUrl);
   }
 
   console.log('Connecting to Pterodactyl WebSocket...');
@@ -120,8 +128,8 @@ async function connectWebSocket() {
   });
 
   wsClient.on('close', () => {
-    console.log('WebSocket closed, reconnecting in 5s...');
-    reconnectTimer = setTimeout(connectWebSocket, 5000);
+    console.log('WebSocket closed, reconnecting in 15s...');
+    reconnectTimer = setTimeout(connectWebSocket, 15000);
   });
 
   wsClient.on('error', (err) => {
