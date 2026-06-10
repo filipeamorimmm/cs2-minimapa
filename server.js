@@ -1,33 +1,126 @@
 const express = require('express');
+const net = require('net');
 const app = express();
 app.use(express.json());
 
 let gameState = {};
 let matchzyEvents = [];
+let rconData = {};
 
-// Recebe dados do GSI padrão
+// RCON config
+const RCON_HOST = '103.14.27.41';
+const RCON_PORT = 27288;
+const RCON_PASSWORD = 'minimapa123';
+
+// RCON implementation
+class RCON {
+  constructor(host, port, password) {
+    this.host = host;
+    this.port = port;
+    this.password = password;
+    this.id = 1;
+  }
+
+  createPacket(id, type, body) {
+    const bodyBuffer = Buffer.from(body + '\0', 'utf8');
+    const buf = Buffer.alloc(4 + 4 + 4 + bodyBuffer.length + 1);
+    buf.writeInt32LE(buf.length - 4, 0);
+    buf.writeInt32LE(id, 4);
+    buf.writeInt32LE(type, 8);
+    bodyBuffer.copy(buf, 12);
+    buf.writeUInt8(0, buf.length - 1);
+    return buf;
+  }
+
+  send(command) {
+    return new Promise((resolve, reject) => {
+      const socket = new net.Socket();
+      let buffer = Buffer.alloc(0);
+      let authenticated = false;
+      let timeout = setTimeout(() => {
+        socket.destroy();
+        reject(new Error('timeout'));
+      }, 5000);
+
+      socket.connect(this.port, this.host, () => {
+        socket.write(this.createPacket(1, 3, this.password));
+      });
+
+      socket.on('data', (data) => {
+        buffer = Buffer.concat([buffer, data]);
+        while (buffer.length >= 4) {
+          const len = buffer.readInt32LE(0) + 4;
+          if (buffer.length < len) break;
+          const packet = buffer.slice(0, len);
+          buffer = buffer.slice(len);
+          const type = packet.readInt32LE(8);
+          const body = packet.slice(12, packet.length - 2).toString('utf8');
+          if (!authenticated) {
+            authenticated = true;
+            socket.write(this.createPacket(2, 2, command));
+          } else {
+            clearTimeout(timeout);
+            socket.destroy();
+            resolve(body);
+          }
+        }
+      });
+
+      socket.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+    });
+  }
+}
+
+const rcon = new RCON(RCON_HOST, RCON_PORT, RCON_PASSWORD);
+
+async function parseStatus(raw) {
+  const lines = raw.split('\n');
+  const players = [];
+  for (const line of lines) {
+    const m = line.match(/^\s*#\s*(\d+)\s+"(.+?)"\s+(\S+)\s+(\d+)\s+(\d+:\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\S+)/);
+    if (m) {
+      players.push({ userid: m[1], name: m[2], steamid: m[3], ping: m[4] });
+    }
+  }
+  const mapM = raw.match(/map\s*:\s*(\S+)/);
+  const map = mapM ? mapM[1] : null;
+  return { players, map };
+}
+
+async function pollRcon() {
+  try {
+    const [statusRaw, scoreRaw] = await Promise.all([
+      rcon.send('status'),
+      rcon.send('mp_teamname_1; mp_teamname_2; mp_ct_wins; mp_t_wins')
+    ]);
+    const status = await parseStatus(statusRaw);
+    rconData = { ...status, raw: statusRaw, updated: Date.now() };
+  } catch (e) {
+    // silently fail
+  }
+}
+
+setInterval(pollRcon, 3000);
+pollRcon();
+
+// Recebe dados do GSI/MatchZy
 app.post('/', (req, res) => {
   const body = req.body;
-  
-  // Detecta se é evento do MatchZy ou GSI padrão
   if (body.event) {
     matchzyEvents.unshift(body);
     if (matchzyEvents.length > 50) matchzyEvents.pop();
-    
-    // Atualiza gameState com dados do MatchZy
-    if (body.map) gameState.map = gameState.map || {};
-    if (body.team1) {
-      gameState.matchzy = body;
-    }
+    if (body.team1_score !== undefined) gameState.matchzy = body;
   } else {
     gameState = body;
   }
-  
   res.sendStatus(200);
 });
 
 app.get('/state', (req, res) => {
-  res.json({ gameState, matchzyEvents });
+  res.json({ gameState, matchzyEvents, rconData });
 });
 
 app.get('/', (req, res) => {
@@ -47,57 +140,29 @@ header h1 { font-size:14px; font-weight:600; letter-spacing:2px; text-transform:
 .container { padding:12px; display:flex; flex-direction:column; gap:12px; }
 .card { background:#111118; border-radius:8px; padding:10px 14px; }
 .card-title { font-size:11px; color:#666; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
-.score-row { display:flex; align-items:center; justify-content:space-between; padding:4px 0; }
-.team-ct { color:#5b9bd5; font-weight:700; font-size:13px; }
-.team-t { color:#d4a017; font-weight:700; font-size:13px; }
-.score-nums { display:flex; align-items:center; gap:12px; }
-.score-nums span { font-size:28px; font-weight:800; }
-.score-divider { font-size:18px; color:#444; }
-.round-info { text-align:center; font-size:11px; color:#666; padding-top:4px; }
 .player-row { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #1a1a22; }
 .player-row:last-child { border-bottom:none; }
-.player-name { flex:1; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.player-hp { font-size:11px; color:#4caf50; width:38px; text-align:right; }
-.player-hp.low { color:#f44336; }
-.player-kd { font-size:11px; color:#888; width:40px; text-align:right; }
-.hp-bar { height:3px; background:#1a1a22; border-radius:2px; width:60px; }
-.hp-fill { height:100%; border-radius:2px; background:#4caf50; }
-.hp-fill.low { background:#f44336; }
-.dead { opacity:0.35; text-decoration:line-through; }
-.team-label { font-size:11px; font-weight:700; margin-bottom:6px; }
-.team-label.ct { color:#5b9bd5; }
-.team-label.t { color:#d4a017; }
-.team-block { margin-bottom:10px; }
-.event-row { font-size:11px; color:#888; padding:3px 0; border-bottom:1px solid #1a1a22; }
-.event-row:last-child { border-bottom:none; }
-.event-type { color:#f0a500; margin-right:6px; }
+.player-name { flex:1; font-size:12px; }
+.player-ping { font-size:11px; color:#888; }
+.map-name { font-size:18px; font-weight:700; color:#f0a500; }
 .no-data { text-align:center; padding:40px 20px; color:#444; font-size:13px; }
-.bomb-planted { color:#f44336; font-weight:700; animation:blink 1s infinite; }
-@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.event-row { font-size:11px; color:#888; padding:3px 0; border-bottom:1px solid #1a1a22; }
+.event-type { color:#f0a500; margin-right:6px; }
 </style>
 </head>
 <body>
 <header><h1>⚡ CS2 Live</h1><span id="status">aguardando...</span></header>
 <div class="container">
-  <div id="nodata" class="no-data">Aguardando partida...<br><small>Conecte ao servidor para ver os dados.</small></div>
-  
-  <div id="scoreboard" class="card" style="display:none">
-    <div class="card-title">Placar</div>
-    <div class="score-row">
-      <span class="team-ct">CT</span>
-      <div class="score-nums"><span id="score-ct">0</span><span class="score-divider">:</span><span id="score-t">0</span></div>
-      <span class="team-t">T</span>
-    </div>
-    <div class="round-info" id="round-info">—</div>
+  <div id="nodata" class="no-data">Aguardando partida...<br><small>Conectando ao servidor via RCON...</small></div>
+  <div id="map-card" class="card" style="display:none">
+    <div class="card-title">Mapa atual</div>
+    <div class="map-name" id="map-name">—</div>
   </div>
-
-  <div id="players-section" class="card" style="display:none">
-    <div class="card-title">Jogadores</div>
-    <div class="team-block"><div class="team-label ct">Counter-Terrorists</div><div id="players-ct"></div></div>
-    <div class="team-block"><div class="team-label t">Terrorists</div><div id="players-t"></div></div>
+  <div id="players-card" class="card" style="display:none">
+    <div class="card-title">Jogadores online</div>
+    <div id="players-list"></div>
   </div>
-
-  <div id="events-section" class="card" style="display:none">
+  <div id="events-card" class="card" style="display:none">
     <div class="card-title">Eventos recentes</div>
     <div id="events-list"></div>
   </div>
@@ -107,60 +172,36 @@ async function fetchState() {
   try {
     const res = await fetch('/state');
     const data = await res.json();
-    const gs = data.gameState;
+    const rcon = data.rconData || {};
     const events = data.matchzyEvents || [];
 
-    const hasGSI = gs.map || gs.allplayers;
-    const hasMatchZy = gs.matchzy || events.length > 0;
-    const hasData = hasGSI || hasMatchZy;
+    const hasPlayers = rcon.players && rcon.players.length > 0;
+    const hasData = hasPlayers || rcon.map;
 
     document.getElementById('nodata').style.display = hasData ? 'none' : 'block';
-    document.getElementById('scoreboard').style.display = hasData ? 'block' : 'none';
-    document.getElementById('players-section').style.display = hasGSI && gs.allplayers ? 'block' : 'none';
-    document.getElementById('events-section').style.display = events.length > 0 ? 'block' : 'none';
+    document.getElementById('map-card').style.display = rcon.map ? 'block' : 'none';
+    document.getElementById('players-card').style.display = hasPlayers ? 'block' : 'none';
+    document.getElementById('events-card').style.display = events.length > 0 ? 'block' : 'none';
 
     const statusEl = document.getElementById('status');
     statusEl.textContent = hasData ? '● AO VIVO' : 'aguardando...';
     statusEl.className = hasData ? 'live' : '';
 
-    // GSI padrão
-    if (gs.map) {
-      document.getElementById('score-ct').textContent = (gs.map.team_ct && gs.map.team_ct.score) || 0;
-      document.getElementById('score-t').textContent = (gs.map.team_t && gs.map.team_t.score) || 0;
-      document.getElementById('round-info').textContent = 'Round ' + (gs.map.round || '?') + ' • ' + (gs.map.phase || '');
+    if (rcon.map) {
+      document.getElementById('map-name').textContent = rcon.map;
     }
 
-    // MatchZy
-    if (gs.matchzy) {
-      const mz = gs.matchzy;
-      if (mz.team1_score !== undefined) {
-        document.getElementById('score-ct').textContent = mz.team1_score || 0;
-        document.getElementById('score-t').textContent = mz.team2_score || 0;
-        document.getElementById('round-info').textContent = (mz.map || '') + ' • Round ' + (mz.round_number || '?');
-        document.getElementById('scoreboard').style.display = 'block';
-        document.getElementById('nodata').style.display = 'none';
-      }
-    }
-
-    // Jogadores GSI
-    if (gs.allplayers) {
-      const ctEl = document.getElementById('players-ct');
-      const tEl = document.getElementById('players-t');
-      ctEl.innerHTML = ''; tEl.innerHTML = '';
-      Object.entries(gs.allplayers).forEach(([id, p]) => {
-        const hp = (p.state && p.state.health) || 0;
-        const alive = hp > 0;
-        const kills = (p.match_stats && p.match_stats.kills) || 0;
-        const deaths = (p.match_stats && p.match_stats.deaths) || 0;
-        const low = hp < 30;
+    if (hasPlayers) {
+      const list = document.getElementById('players-list');
+      list.innerHTML = '';
+      rcon.players.forEach(p => {
         const row = document.createElement('div');
-        row.className = 'player-row' + (alive ? '' : ' dead');
-        row.innerHTML = '<span class="player-name">' + (p.name || id) + '</span><div class="hp-bar"><div class="hp-fill ' + (low ? 'low' : '') + '" style="width:' + hp + '%"></div></div><span class="player-hp ' + (low ? 'low' : '') + '">' + hp + 'hp</span><span class="player-kd">' + kills + '/' + deaths + '</span>';
-        if (p.team === 'CT') ctEl.appendChild(row); else tEl.appendChild(row);
+        row.className = 'player-row';
+        row.innerHTML = '<span class="player-name">' + p.name + '</span><span class="player-ping">' + p.ping + 'ms</span>';
+        list.appendChild(row);
       });
     }
 
-    // Eventos MatchZy
     if (events.length > 0) {
       const evEl = document.getElementById('events-list');
       evEl.innerHTML = '';
@@ -169,18 +210,17 @@ async function fetchState() {
         row.className = 'event-row';
         let desc = '';
         if (ev.event === 'player_death') desc = (ev.attacker_name || '?') + ' matou ' + (ev.player_name || '?');
-        else if (ev.event === 'round_end') desc = 'Round ' + (ev.round_number || '?') + ' encerrado — ' + (ev.winner || '');
+        else if (ev.event === 'round_end') desc = 'Round ' + (ev.round_number || '?') + ' encerrado';
         else if (ev.event === 'bomb_planted') desc = '💣 Bomba plantada!';
         else if (ev.event === 'bomb_defused') desc = '✅ Bomba defusada!';
-        else if (ev.event === 'bomb_exploded') desc = '💥 Bomba explodiu!';
-        else desc = ev.event || JSON.stringify(ev).slice(0, 60);
-        row.innerHTML = '<span class="event-type">' + (ev.event || 'evento') + '</span>' + desc;
+        else desc = ev.event || '';
+        row.innerHTML = '<span class="event-type">' + (ev.event || '') + '</span>' + desc;
         evEl.appendChild(row);
       });
     }
   } catch(e) {}
 }
-setInterval(fetchState, 1000);
+setInterval(fetchState, 2000);
 fetchState();
 </script>
 </body>
