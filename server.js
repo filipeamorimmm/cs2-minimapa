@@ -25,6 +25,8 @@ let wsSocketUrl = null;
 let reconnectTimer = null;
 
 async function fetchWsCredentials() {
+  wsToken = null;
+  wsSocketUrl = null;
   try {
     const res = await fetch(`${PTERO_URL}/api/client/servers/${SERVER_ID}/websocket`, {
       headers: {
@@ -44,12 +46,8 @@ async function fetchWsCredentials() {
     wsSocketUrl = data.data.socket;
     console.log('Socket URL recebida:', wsSocketUrl);
 
-    // Corrige: ws:// → wss:// e remove :8080 mantendo o path completo
-    wsSocketUrl = wsSocketUrl
-      .replace(/^ws:\/\/[^/]+/, (match) => {
-        return 'wss://painel3.firegamesnetwork.com';
-      });
-
+    // Substitui tudo antes do path por wss://painel3...
+    wsSocketUrl = wsSocketUrl.replace(/^wss?:\/\/[^/]+/, 'wss://painel3.firegamesnetwork.com');
     console.log('Socket URL corrigida para:', wsSocketUrl);
     return true;
   } catch (e) {
@@ -97,8 +95,8 @@ async function sendWsCommand(command) {
 async function connectWebSocket() {
   const ok = await fetchWsCredentials();
   if (!ok) {
-    console.log('Aguardando 30s antes de tentar novamente...');
-    reconnectTimer = setTimeout(connectWebSocket, 30000);
+    console.log('Aguardando 60s antes de tentar novamente...');
+    reconnectTimer = setTimeout(connectWebSocket, 60000);
     return;
   }
 
@@ -120,16 +118,16 @@ async function connectWebSocket() {
         msg.args.forEach(line => processConsoleLine(line));
       }
       if (msg.event === 'token expiring' || msg.event === 'token expired') {
-        fetchWsCredentials().then(() => {
-          if (wsToken) wsClient.send(JSON.stringify({ event: 'auth', args: [wsToken] }));
+        fetchWsCredentials().then((ok) => {
+          if (ok && wsToken) wsClient.send(JSON.stringify({ event: 'auth', args: [wsToken] }));
         });
       }
     } catch (e) {}
   });
 
   wsClient.on('close', () => {
-    console.log('WebSocket closed, reconnecting in 15s...');
-    reconnectTimer = setTimeout(connectWebSocket, 15000);
+    console.log('WebSocket closed, reconnecting in 20s...');
+    reconnectTimer = setTimeout(connectWebSocket, 20000);
   });
 
   wsClient.on('error', (err) => {
