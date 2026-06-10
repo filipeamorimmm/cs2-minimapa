@@ -15,7 +15,6 @@ let matchState = {
 let consoleData = { players: [], map: null, updated: null };
 let consoleLines = [];
 
-// ─── PTERODACTYL CONFIG ───────────────────────────────────────────────────────
 const PTERO_URL = 'https://painel3.firegamesnetwork.com';
 const PTERO_KEY = 'ptlc_xWQ2v95dY1ds00JAX39dQPVuwivxCe0aBLNF1QZhzYt';
 const SERVER_ID = 'a93a9b62';
@@ -34,10 +33,10 @@ async function fetchWsCredentials() {
       }
     });
     const data = await res.json();
-    console.log('WS credentials response:', JSON.stringify(data));  // DEBUG
+    console.log('WS credentials response:', JSON.stringify(data));
     wsToken = data.data.token;
     wsSocketUrl = data.data.socket;
-    console.log('Socket URL recebida:', wsSocketUrl);  // DEBUG
+    console.log('Socket URL recebida:', wsSocketUrl);
     return true;
   } catch (e) {
     console.error('Failed to fetch WS credentials:', e.message);
@@ -88,9 +87,10 @@ async function connectWebSocket() {
     return;
   }
 
-  // Se a URL vier com IP:8080, troca pelo domínio
-  if (wsSocketUrl && wsSocketUrl.includes('103.14.27.41:8080')) {
-    wsSocketUrl = wsSocketUrl.replace('ws://103.14.27.41:8080', 'wss://painel3.firegamesnetwork.com');
+  if (wsSocketUrl) {
+    wsSocketUrl = wsSocketUrl
+      .replace('ws://', 'wss://')
+      .replace(':8080', '');
     console.log('Socket URL corrigida para:', wsSocketUrl);
   }
 
@@ -107,7 +107,7 @@ async function connectWebSocket() {
   wsClient.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
-      console.log('WS event:', msg.event);  // DEBUG
+      console.log('WS event:', msg.event);
       if (msg.event === 'console output' && msg.args) {
         msg.args.forEach(line => processConsoleLine(line));
       }
@@ -132,7 +132,7 @@ async function connectWebSocket() {
 setInterval(() => sendWsCommand('status'), 5000);
 connectWebSocket();
 
-// ─── GET5 / MATCHZY WEBHOOK ───────────────────────────────────────────────────
+// ─── WEBHOOKS ─────────────────────────────────────────────────────────────────
 app.post('/get5', (req, res) => {
   const body = req.body;
   if (!body || !body.event) return res.sendStatus(400);
