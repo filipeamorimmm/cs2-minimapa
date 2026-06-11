@@ -1,214 +1,43 @@
 const express = require('express');
-const WebSocket = require('ws');
 const app = express();
 app.use(express.json());
 
-let get5Events = [];
 let matchState = {
   map: null,
-  team1: { name: 'CT', score: 0 },
-  team2: { name: 'TR', score: 0 },
+  phase: null,
   round: 0,
-  phase: 'aguardando',
-  players: {},
+  team1: { name: 'CT', score: 0 },
+  team2: { name: 'T', score: 0 },
+  players: {}
 };
-let consoleData = { players: [], map: null, updated: null };
-let consoleLines = [];
+let events = [];
 
-const PTERO_URL = 'https://painel3.firegamesnetwork.com';
-const PTERO_KEY = 'ptlc_xWQ2v95dY1ds00JAX39dQPVuwivxCe0aBLNF1QZhzYt';
-const SERVER_ID = 'a93a9b62';
-
-let wsClient = null;
-let wsToken = null;
-let wsSocketUrl = null;
-let reconnectTimer = null;
-
-async function fetchWsCredentials() {
-  wsToken = null;
-  wsSocketUrl = null;
-  try {
-    const res = await fetch(`${PTERO_URL}/api/client/servers/${SERVER_ID}/websocket`, {
-      headers: {
-        'Authorization': `Bearer ${PTERO_KEY}`,
-        'Accept': 'application/json'
-      }
-    });
-    const data = await res.json();
-    console.log('WS credentials response:', JSON.stringify(data));
-
-    if (!data.data || !data.data.token) {
-      console.error('Sem token na resposta:', JSON.stringify(data));
-      return false;
-    }
-
-    wsToken = data.data.token;
-    // Monta URL na mão com o path correto do Pterodactyl
-    wsSocketUrl = `wss://painel3.firegamesnetwork.com/api/client/servers/${SERVER_ID}/websocket`;
-    console.log('Socket URL usada:', wsSocketUrl);
-    return true;
-  } catch (e) {
-    console.error('Failed to fetch WS credentials:', e.message);
-    return false;
-  }
-}
-
-function parseStatusBlock(lines) {
-  const players = [];
-  for (const line of lines) {
-    const m = line.match(/^\s*#\s*(\d+)\s+"(.+?)"\s+(\S+)\s+(\d+)\s+(\d+:\d+)/);
-    if (m && m[2] !== 'SourceTV') {
-      players.push({ userid: m[1], name: m[2], steamid: m[3], ping: m[4] });
-    }
-  }
-  const mapLine = lines.find(l => l.includes('map     :') || l.match(/map\s*:\s*\S+/));
-  let map = null;
-  if (mapLine) {
-    const mm = mapLine.match(/map\s*:\s*(\S+)/);
-    if (mm) map = mm[1];
-  }
-  return { players, map };
-}
-
-function processConsoleLine(line) {
-  consoleLines.push(line);
-  if (consoleLines.length > 300) consoleLines = consoleLines.slice(-300);
-
-  if (line.includes('#end') && consoleLines.some(l => l.includes('map     :'))) {
-    const parsed = parseStatusBlock(consoleLines);
-    if (parsed.map) {
-      consoleData = { ...parsed, updated: Date.now() };
-      matchState.map = parsed.map;
-    }
-  }
-}
-
-async function sendWsCommand(command) {
-  if (wsClient && wsClient.readyState === WebSocket.OPEN) {
-    wsClient.send(JSON.stringify({ event: 'send command', args: [command] }));
-  }
-}
-
-async function connectWebSocket() {
-  const ok = await fetchWsCredentials();
-  if (!ok) {
-    console.log('Aguardando 60s antes de tentar novamente...');
-    reconnectTimer = setTimeout(connectWebSocket, 60000);
-    return;
-  }
-
-  console.log('Connecting to Pterodactyl WebSocket...');
-  wsClient = new WebSocket(wsSocketUrl, {
-    headers: { 'Origin': PTERO_URL }
-  });
-
-  wsClient.on('open', () => {
-    console.log('WebSocket connected!');
-    wsClient.send(JSON.stringify({ event: 'auth', args: [wsToken] }));
-  });
-
-  wsClient.on('message', (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      console.log('WS event:', msg.event);
-      if (msg.event === 'console output' && msg.args) {
-        msg.args.forEach(line => processConsoleLine(line));
-      }
-      if (msg.event === 'token expiring' || msg.event === 'token expired') {
-        fetchWsCredentials().then((ok) => {
-          if (ok && wsToken) wsClient.send(JSON.stringify({ event: 'auth', args: [wsToken] }));
-        });
-      }
-    } catch (e) {}
-  });
-
-  wsClient.on('close', () => {
-    console.log('WebSocket closed, reconnecting in 20s...');
-    reconnectTimer = setTimeout(connectWebSocket, 20000);
-  });
-
-  wsClient.on('error', (err) => {
-    console.error('WebSocket error:', err.message);
-  });
-}
-
-setInterval(() => sendWsCommand('status'), 5000);
-connectWebSocket();
-
-// ─── WEBHOOKS ─────────────────────────────────────────────────────────────────
-app.post('/get5', (req, res) => {
+// Recebe dados do plugin CS2LivePlugin
+app.post('/gamestate', (req, res) => {
   const body = req.body;
-  if (!body || !body.event) return res.sendStatus(400);
-  const ev = body.event;
-  const p = body.params || {};
-
-  get5Events.unshift({ event: ev, params: p, ts: Date.now() });
-  if (get5Events.length > 100) get5Events.pop();
-
-  switch (ev) {
-    case 'game_state_changed':
-      matchState.phase = p.new_state || matchState.phase;
-      break;
-    case 'series_start':
-      matchState.team1.name = p.team1_name || 'CT';
-      matchState.team2.name = p.team2_name || 'TR';
-      matchState.team1.score = 0;
-      matchState.team2.score = 0;
-      matchState.round = 0;
-      matchState.players = {};
-      break;
-    case 'round_start':
-      matchState.round = p.round_number ?? matchState.round;
-      break;
-    case 'round_end':
-      matchState.round = p.round_number ?? matchState.round;
-      matchState.team1.score = p.team1_score ?? matchState.team1.score;
-      matchState.team2.score = p.team2_score ?? matchState.team2.score;
-      break;
-    case 'player_death': {
-      const killer = p.attacker_steamid;
-      if (killer && killer !== p.victim_steamid) {
-        if (!matchState.players[killer]) matchState.players[killer] = { name: p.attacker_name || killer, kills: 0, deaths: 0, assists: 0 };
-        matchState.players[killer].kills++;
-        matchState.players[killer].name = p.attacker_name || killer;
-      }
-      const victim = p.victim_steamid;
-      if (victim) {
-        if (!matchState.players[victim]) matchState.players[victim] = { name: p.victim_name || victim, kills: 0, deaths: 0, assists: 0 };
-        matchState.players[victim].deaths++;
-        matchState.players[victim].name = p.victim_name || victim;
-      }
-      if (p.assister_steamid) {
-        const a = p.assister_steamid;
-        if (!matchState.players[a]) matchState.players[a] = { name: p.assister_name || a, kills: 0, deaths: 0, assists: 0 };
-        matchState.players[a].assists++;
-      }
-      break;
+  if (!body) return res.sendStatus(400);
+  if (body.map) matchState.map = body.map;
+  if (body.phase) matchState.phase = body.phase;
+  if (body.round !== undefined) matchState.round = body.round;
+  if (body.team1) matchState.team1 = body.team1;
+  if (body.team2) matchState.team2 = body.team2;
+  if (body.players) {
+    matchState.players = {};
+    for (const p of body.players) {
+      matchState.players[p.name] = p;
     }
-    case 'map_picked':
-      if (p.map_name) matchState.map = p.map_name;
-      break;
-    case 'series_end':
-      matchState.phase = 'encerrado';
-      break;
   }
-  res.sendStatus(200);
-});
-
-app.post('/', (req, res) => {
-  const body = req.body;
-  if (body && body.event) {
-    get5Events.unshift({ event: body.event, params: body, ts: Date.now() });
-    if (get5Events.length > 100) get5Events.pop();
+  if (body.event) {
+    events.unshift(body);
+    if (events.length > 50) events.pop();
   }
   res.sendStatus(200);
 });
 
 app.get('/state', (req, res) => {
-  res.json({ matchState, get5Events: get5Events.slice(0, 50), consoleData });
+  res.json({ matchState, events });
 });
 
-// ─── FRONTEND ─────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR">
@@ -218,125 +47,139 @@ app.get('/', (req, res) => {
 <title>CS2 Live</title>
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
-body { background:#0a0a0f; color:#e0e0e0; font-family:'Segoe UI',sans-serif; min-height:100vh; }
+body { background:#0a0a0f; color:#e0e0e0; font-family:'Segoe UI',sans-serif; }
 header { background:#111118; padding:10px 16px; display:flex; align-items:center; border-bottom:1px solid #222; }
 header h1 { font-size:14px; font-weight:600; letter-spacing:2px; text-transform:uppercase; color:#f0a500; }
 #status { font-size:11px; color:#666; margin-left:auto; }
 #status.live { color:#4caf50; }
-.container { padding:12px; display:flex; flex-direction:column; gap:12px; max-width:500px; margin:0 auto; }
+.container { padding:12px; display:flex; flex-direction:column; gap:12px; }
 .card { background:#111118; border-radius:8px; padding:10px 14px; }
 .card-title { font-size:11px; color:#666; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
-.scoreboard { display:flex; align-items:center; justify-content:space-between; }
-.team { display:flex; flex-direction:column; align-items:center; gap:4px; flex:1; }
-.team-name { font-size:12px; color:#aaa; text-transform:uppercase; letter-spacing:1px; }
-.team-score { font-size:40px; font-weight:800; color:#f0a500; line-height:1; }
-.score-divider { font-size:20px; color:#333; padding:0 8px; }
-.round-info { text-align:center; font-size:11px; color:#666; margin-top:6px; }
-.player-row { display:flex; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid #1a1a22; font-size:12px; }
+.score-row { display:flex; align-items:center; justify-content:space-between; }
+.team-ct { color:#5b9bd5; font-weight:700; font-size:13px; }
+.team-t { color:#d4a017; font-weight:700; font-size:13px; }
+.score-nums { display:flex; align-items:center; gap:12px; }
+.score-nums span { font-size:28px; font-weight:800; }
+.score-divider { font-size:18px; color:#444; }
+.round-info { text-align:center; font-size:11px; color:#666; padding-top:4px; }
+.player-row { display:flex; align-items:center; gap:8px; padding:4px 0; border-bottom:1px solid #1a1a22; }
 .player-row:last-child { border-bottom:none; }
-.player-name { flex:1; }
-.kda { color:#888; font-size:11px; font-family:monospace; }
-.map-name { font-size:18px; font-weight:700; color:#f0a500; }
-.event-row { font-size:11px; color:#888; padding:4px 0; border-bottom:1px solid #1a1a22; display:flex; gap:6px; }
+.player-name { flex:1; font-size:12px; }
+.player-hp { font-size:11px; color:#4caf50; width:38px; text-align:right; }
+.player-hp.low { color:#f44336; }
+.player-kd { font-size:11px; color:#888; width:40px; text-align:right; }
+.hp-bar { height:3px; background:#1a1a22; border-radius:2px; width:60px; }
+.hp-fill { height:100%; border-radius:2px; background:#4caf50; }
+.hp-fill.low { background:#f44336; }
+.dead { opacity:0.35; text-decoration:line-through; }
+.team-label { font-size:11px; font-weight:700; margin-bottom:6px; }
+.team-label.ct { color:#5b9bd5; }
+.team-label.t { color:#d4a017; }
+.team-block { margin-bottom:10px; }
+.event-row { font-size:11px; color:#888; padding:3px 0; border-bottom:1px solid #1a1a22; }
 .event-row:last-child { border-bottom:none; }
-.event-type { color:#f0a500; white-space:nowrap; }
-.event-time { color:#444; font-size:10px; white-space:nowrap; margin-left:auto; }
+.event-kill { color:#f44336; }
+.event-bomb { color:#f0a500; }
 .no-data { text-align:center; padding:40px 20px; color:#444; font-size:13px; }
 </style>
 </head>
 <body>
 <header><h1>⚡ CS2 Live</h1><span id="status">aguardando...</span></header>
 <div class="container">
-  <div id="nodata" class="no-data">Aguardando partida...<br><small>Conectando via WebSocket</small></div>
-  <div id="score-card" class="card" style="display:none">
-    <div class="card-title">Placar</div>
-    <div class="scoreboard">
-      <div class="team"><div class="team-name" id="team1-name">CT</div><div class="team-score" id="team1-score">0</div></div>
-      <div class="score-divider">×</div>
-      <div class="team"><div class="team-score" id="team2-score">0</div><div class="team-name" id="team2-name">TR</div></div>
+  <div id="nodata" class="no-data">Aguardando partida...<br><small>Plugin CS2Live precisa estar ativo no servidor.</small></div>
+
+  <div id="scoreboard" class="card" style="display:none">
+    <div class="card-title" id="map-name">Mapa</div>
+    <div class="score-row">
+      <span class="team-ct" id="team1-name">CT</span>
+      <div class="score-nums">
+        <span id="score-ct">0</span>
+        <span class="score-divider">:</span>
+        <span id="score-t">0</span>
+      </div>
+      <span class="team-t" id="team2-name">T</span>
     </div>
-    <div class="round-info">Round <span id="round-num">—</span> · <span id="phase-text">—</span></div>
+    <div class="round-info" id="round-info">—</div>
   </div>
-  <div id="map-card" class="card" style="display:none">
-    <div class="card-title">Mapa</div>
-    <div class="map-name" id="map-name">—</div>
-  </div>
-  <div id="players-card" class="card" style="display:none">
+
+  <div id="players-section" class="card" style="display:none">
     <div class="card-title">Jogadores</div>
-    <div id="players-list"></div>
+    <div class="team-block"><div class="team-label ct">Counter-Terrorists</div><div id="players-ct"></div></div>
+    <div class="team-block"><div class="team-label t">Terrorists</div><div id="players-t"></div></div>
   </div>
-  <div id="events-card" class="card" style="display:none">
+
+  <div id="events-section" class="card" style="display:none">
     <div class="card-title">Eventos recentes</div>
     <div id="events-list"></div>
   </div>
 </div>
 <script>
-function timeSince(ts) {
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return s + 's atrás';
-  return Math.floor(s/60) + 'min atrás';
-}
-function eventDesc(ev, p) {
-  switch(ev) {
-    case 'player_death': return (p.attacker_name||'?') + ' ➜ ' + (p.victim_name||'?') + (p.weapon ? ' ['+p.weapon+']' : '');
-    case 'round_end': return 'Round ' + (p.round_number||'?') + ' encerrado';
-    case 'bomb_planted': return '💣 Plantada por ' + (p.player_name||'?');
-    case 'bomb_defused': return '✅ Defusada por ' + (p.player_name||'?');
-    case 'bomb_exploded': return '💥 Bomba explodiu!';
-    case 'series_start': return '🟢 Série iniciada';
-    case 'series_end': return '🏁 Série encerrada';
-    default: return ev;
-  }
-}
 async function fetchState() {
   try {
     const res = await fetch('/state');
     const data = await res.json();
-    const ms = data.matchState || {};
-    const events = data.get5Events || [];
-    const cd = data.consoleData || {};
-    const hasMatch = ms.phase && ms.phase !== 'aguardando';
-    const hasPlayers = Object.keys(ms.players || {}).length > 0;
-    const hasConsole = cd.players && cd.players.length > 0;
-    const map = ms.map || cd.map;
-    const hasData = hasMatch || hasPlayers || hasConsole || map;
+    const ms = data.matchState;
+    const evs = data.events || [];
+
+    const players = Object.values(ms.players || {});
+    const hasData = ms.map || players.length > 0;
+
     document.getElementById('nodata').style.display = hasData ? 'none' : 'block';
+    document.getElementById('scoreboard').style.display = hasData ? 'block' : 'none';
+    document.getElementById('players-section').style.display = players.length > 0 ? 'block' : 'none';
+    document.getElementById('events-section').style.display = evs.length > 0 ? 'block' : 'none';
+
     const statusEl = document.getElementById('status');
     statusEl.textContent = hasData ? '● AO VIVO' : 'aguardando...';
     statusEl.className = hasData ? 'live' : '';
-    const showScore = hasMatch || (ms.team1 && (ms.team1.score > 0 || ms.team2.score > 0));
-    document.getElementById('score-card').style.display = showScore ? 'block' : 'none';
-    if (showScore) {
-      document.getElementById('team1-name').textContent = ms.team1?.name || 'CT';
-      document.getElementById('team2-name').textContent = ms.team2?.name || 'TR';
-      document.getElementById('team1-score').textContent = ms.team1?.score ?? 0;
-      document.getElementById('team2-score').textContent = ms.team2?.score ?? 0;
-      document.getElementById('round-num').textContent = ms.round || '—';
-      document.getElementById('phase-text').textContent = ms.phase || '—';
-    }
-    document.getElementById('map-card').style.display = map ? 'block' : 'none';
-    if (map) document.getElementById('map-name').textContent = map;
-    document.getElementById('players-card').style.display = (hasPlayers || hasConsole) ? 'block' : 'none';
-    if (hasPlayers) {
-      const list = document.getElementById('players-list');
-      list.innerHTML = Object.values(ms.players).sort((a,b)=>b.kills-a.kills).map(p =>
-        '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.kills+'/'+p.deaths+'/'+p.assists+'</span></div>'
-      ).join('');
-    } else if (hasConsole) {
-      const list = document.getElementById('players-list');
-      list.innerHTML = cd.players.map(p =>
-        '<div class="player-row"><span class="player-name">'+p.name+'</span><span class="kda">'+p.ping+'ms</span></div>'
-      ).join('');
-    }
-    document.getElementById('events-card').style.display = events.length > 0 ? 'block' : 'none';
-    if (events.length > 0) {
-      document.getElementById('events-list').innerHTML = events.slice(0,15).map(ev =>
-        '<div class="event-row"><span class="event-type">'+ev.event+'</span><span style="flex:1">'+eventDesc(ev.event,ev.params||{})+'</span><span class="event-time">'+timeSince(ev.ts)+'</span></div>'
-      ).join('');
-    }
+
+    if (ms.map) document.getElementById('map-name').textContent = ms.map;
+    document.getElementById('score-ct').textContent = ms.team1?.score || 0;
+    document.getElementById('score-t').textContent = ms.team2?.score || 0;
+    document.getElementById('team1-name').textContent = ms.team1?.name || 'CT';
+    document.getElementById('team2-name').textContent = ms.team2?.name || 'T';
+    document.getElementById('round-info').textContent = 'Round ' + (ms.round || '?') + ' • ' + (ms.phase || '');
+
+    const ctEl = document.getElementById('players-ct');
+    const tEl = document.getElementById('players-t');
+    ctEl.innerHTML = ''; tEl.innerHTML = '';
+    players.forEach(p => {
+      const hp = p.health || 0;
+      const alive = hp > 0;
+      const low = hp < 30;
+      const row = document.createElement('div');
+      row.className = 'player-row' + (alive ? '' : ' dead');
+      row.innerHTML = '<span class="player-name">' + p.name + '</span>' +
+        '<div class="hp-bar"><div class="hp-fill ' + (low?'low':'') + '" style="width:' + hp + '%"></div></div>' +
+        '<span class="player-hp ' + (low?'low':'') + '">' + hp + 'hp</span>' +
+        '<span class="player-kd">' + (p.kills||0) + '/' + (p.deaths||0) + '</span>';
+      if (p.team === 'CT') ctEl.appendChild(row);
+      else tEl.appendChild(row);
+    });
+
+    const evEl = document.getElementById('events-list');
+    evEl.innerHTML = '';
+    evs.slice(0, 15).forEach(ev => {
+      const row = document.createElement('div');
+      row.className = 'event-row';
+      let text = '';
+      if (ev.event === 'player_death') {
+        text = '<span class="event-kill">💀 ' + (ev.attacker || '?') + ' → ' + (ev.victim || '?') + (ev.weapon ? ' [' + ev.weapon + ']' : '') + '</span>';
+      } else if (ev.event === 'bomb_planted') {
+        text = '<span class="event-bomb">💣 Bomba plantada por ' + (ev.player || '?') + '</span>';
+      } else if (ev.event === 'bomb_defused') {
+        text = '<span class="event-bomb">✅ Bomba defusada por ' + (ev.player || '?') + '</span>';
+      } else if (ev.event === 'round_end') {
+        text = 'Round ' + (ev.round || '?') + ' — ' + (ev.winner || '') + ' venceu';
+      } else {
+        text = ev.event || '';
+      }
+      row.innerHTML = text;
+      evEl.appendChild(row);
+    });
   } catch(e) {}
 }
-setInterval(fetchState, 2000);
+setInterval(fetchState, 1000);
 fetchState();
 </script>
 </body>
